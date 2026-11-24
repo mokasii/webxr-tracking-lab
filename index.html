@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>WebXR Tracking Lab – v0.1</title>
+<style>
+:root{color-scheme:dark;font:16px system-ui,sans-serif;background:#101820;color:#f0f5f6}*{box-sizing:border-box}body{margin:0}main{max-width:600px;margin:auto;padding:24px 16px}h1{font-size:1.7rem;margin:0 0 8px}p{line-height:1.5;margin:8px 0 14px;color:#c3cdd2}button,input,select{font:inherit}button{border:1px solid #577078;border-radius:10px;background:#263a40;color:#fff;padding:12px;min-height:46px;cursor:pointer;font-weight:650}button.primary{background:#1b6854;border-color:#6bc9ab}button:disabled{opacity:.45;cursor:default}button.danger{background:#592e31}label{display:block;color:#c5d0d4;font-size:.85rem;margin:8px 0 5px}input,select{width:100%;padding:10px;border-radius:8px;border:1px solid #577078;background:#15242b;color:white} .card{background:#19282e;border:1px solid #31474f;border-radius:14px;padding:15px;margin:15px 0}.row{display:flex;gap:8px;flex-wrap:wrap}.row>*{flex:1}.small{font-size:.83rem;color:#c1cdd1}#status,#xrStatus{white-space:pre-wrap;overflow-wrap:anywhere}#overlay{position:fixed;inset:0;pointer-events:none;display:none;background:transparent;padding: max(10px,env(safe-area-inset-top)) 10px max(12px,env(safe-area-inset-bottom));flex-direction:column;justify-content:space-between;color:white}#overlay.active{display:flex}#overlay .panel{pointer-events:auto;background:rgba(13,27,32,.92);border:1px solid #71918e;border-radius:12px;padding:10px;max-width:600px;width:100%;align-self:center}#overlay .top{pointer-events:none}#overlay .panel button{pointer-events:auto}#overlay .panel .small{margin:3px 0}#live{font:600 1.03rem ui-monospace,monospace;margin:5px 0}#target{font-size:1.15rem;font-weight:700;margin:5px 0 8px}#xrStatus{font-size:.85rem;color:#d3e8e1;min-height:1.3em}#capture{width:100%;margin-bottom:6px}table{width:100%;border-collapse:collapse;font-size:.84rem;font-variant-numeric:tabular-nums}th,td{text-align:left;padding:7px 4px;border-bottom:1px solid #385057}#summary{overflow-x:auto}#status[data-bad=true]{color:#ffb5a5}canvas{display:none}#overlay:fullscreen{background:transparent}body.inXR main{display:none}
+</style>
+</head>
+<body>
+<main>
+<h1>WebXR Tracking Lab</h1><div class="small">v0.1 · Explorative Messung des lokalen Trackings</div>
+<p>Erfasse die horizontale Distanz zum Start und den Rückkehrfehler an real vermessenen Kontrollpunkten. Keine GPS- oder Markerdaten.</p>
+<section class="card">
+<label for="environment">Umgebung</label><select id="environment"><option>merkmalsreich</option><option>merkmalsarm</option><option>Probemessung</option></select>
+<label for="device">Gerät / Browser / Version (optional)</label><input id="device" value="Nothing Phone (4a) Pro / Brave" maxlength="150">
+<p class="small" id="status" role="status">Prüfe WebXR …</p>
+<button class="primary" id="start" disabled>AR-Messung starten</button>
+<p class="small">Reihenfolge: 0 m → 2 m → 5 m → 10 m → zurück zu 0 m. Am Messpunkt anhalten, Kamera auf gleicher Höhe und möglichst gleicher Ausrichtung halten. Nicht beim Gehen auf den Bildschirm schauen.</p>
+</section>
+<section class="card"><h2 style="font-size:1.1rem;margin-top:0">Messdaten</h2><div id="summary">Noch keine Messungen.</div><p class="small">CSV enthält Rohkoordinaten, Zeit, Durchgang, Sollentfernung, horizontale Distanz und Fehler, Trackingstatus sowie Reset-Hinweise. Daten werden nach Möglichkeit lokal im Browser gespeichert.</p><div class="row"><button id="export" disabled>CSV exportieren</button><button id="clear" disabled>Daten löschen</button></div></section>
+<p class="small">WebXR benötigt einen sicheren Kontext (HTTPS) und Unterstützung für immersive-ar sowie DOM Overlay. Keine Datenübertragung durch diese Anwendung.</p>
+</main>
+<div id="overlay"><div class="panel top"><div class="small" id="runLabel">Messung</div><div id="live">Warte auf Tracking …</div><div id="radial" class="small"></div><div id="xrStatus" role="status"></div></div><div class="panel"><div id="target">Startpunkt (0 m)</div><button class="primary" id="capture" disabled>Startpunkt erfassen</button><div class="row"><button id="undo" disabled>Letzten Punkt löschen</button><button id="stop" class="danger">AR beenden</button></div></div></div>
+<canvas id="canvas"></canvas>
+<script>
+'use strict';
+const $=id=>document.getElementById(id);
+const STEPS=[{label:'Start',m:0},{label:'2 m',m:2},{label:'5 m',m:5},{label:'10 m',m:10},{label:'Rückkehr',m:0}];
+const STORE='webxr-tracking-lab-v01';
+let runs=[];try{const stored=JSON.parse(localStorage.getItem(STORE)||'[]');if(Array.isArray(stored))runs=stored;}catch(e){}
+let session=null,space=null,gl=null,active=null,origin=null,requested=false,latest=null,lastUI=0,canStart=false,starting=false;
+const fmt=(n,d=3)=>Number(n).toFixed(d);
+function save(){try{localStorage.setItem(STORE,JSON.stringify(runs));}catch(e){$('status').textContent='Lokales Speichern nicht möglich. Bitte CSV exportieren.';}}
+function status(text,bad=false){$('status').textContent=text;$('status').dataset.bad=String(bad);}
+function updateSummary(){
+ const el=$('summary');el.replaceChildren();
+ const all=runs.flatMap(r=>r.points);$('export').disabled=!all.length||!!session;$('clear').disabled=!runs.length||!!session;
+ if(!all.length){el.textContent='Noch keine Messungen.';return;}
+ const table=document.createElement('table');const head=table.createTHead().insertRow();for(const s of ['Lauf','Punkt','Ist (m)','Fehler (cm)','Status']){const th=document.createElement('th');th.textContent=s;head.append(th);}
+ const body=table.createTBody();for(const r of runs){for(const p of r.points){const row=body.insertRow();for(const v of [r.id,p.label,fmt(p.distance),fmt(p.error*100,1),r.resets.length?'Reset – prüfen':r.points.length===5?'vollständig':'Teilreihe'])row.insertCell().textContent=v;}}el.append(table);
+}
+function coords(p){return {x:p.x,y:p.y,z:p.z};}
+function horizontal(p,o){return Math.hypot(p.x-o.x,p.z-o.z);}
+function updateOverlay(){
+ if(!active)return;
+ const next=STEPS[active.points.length];$('runLabel').textContent=`Durchgang ${active.id} · ${active.environment} · ${active.points.length}/5`;
+ $('target').textContent=next?`Nächster Punkt: ${next.label}${next.label==='Rückkehr'?' (0 m)':''}`:'Durchgang vollständig. AR beenden.';
+ $('capture').textContent=next?(active.points.length===0?'Startpunkt erfassen':`${next.label} erfassen`):'Alle Punkte erfasst';
+ $('capture').disabled=!next||!latest||latest.emulated||requested||active.resets.length>0;
+ $('undo').disabled=!active.points.length||requested||active.resets.length>0;
+}
+function frameLoop(t,frame){
+ const s=frame.session;if(s!==session||!active)return;s.requestAnimationFrame(frameLoop);
+ const layer=s.renderState.baseLayer;gl.bindFramebuffer(gl.FRAMEBUFFER,layer.framebuffer);gl.clearColor(0,0,0,0);gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
+ const pose=frame.getViewerPose(space);
+ latest=pose?{p:coords(pose.transform.position),q:coords(pose.transform.orientation),w:pose.transform.orientation.w,emulated:!!pose.emulatedPosition,time:t}:null;
+ if(requested){requested=false;const step=STEPS[active.points.length];if(latest&&!latest.emulated&&step&&!active.resets.length){
+    const p=latest.p;if(!origin)origin={...p};const distance=horizontal(p,origin);
+    active.points.push({label:step.label,target:step.m,x:p.x,y:p.y,z:p.z,dx:p.x-origin.x,dy:p.y-origin.y,dz:p.z-origin.z,qx:latest.q.x,qy:latest.q.y,qz:latest.q.z,qw:latest.w,distance,error:Math.abs(distance-step.m),signed_error:distance-step.m,frame_ms:t,utc:new Date().toISOString(),tracking_loss_events:active.losses});save();
+    $('xrStatus').textContent=`${step.label} gespeichert.`;
+ }else{$('xrStatus').textContent='Keine verlässliche Pose. Bitte erneut versuchen.';}updateOverlay();}
+ const invalid=!latest||latest.emulated;if(invalid&&!active.wasInvalid){active.losses++;active.wasInvalid=true;save();}else if(!invalid)active.wasInvalid=false;
+ if(t-lastUI>100){lastUI=t;if(latest){const p=latest.p,o=origin||{x:0,y:0,z:0};$('live').textContent=`X ${fmt(p.x-o.x)} · Y ${fmt(p.y-o.y)} · Z ${fmt(p.z-o.z)} m`;$('radial').textContent=origin?`Horizontal zum Start: ${fmt(horizontal(p,origin))} m`:'Koordinaten relativ zum XR-Ursprung';}else{$('live').textContent='Keine Pose verfügbar';$('radial').textContent='';}
+ if(active.resets.length)$('xrStatus').textContent='Referenzraum-Reset! Lauf abbrechen und wiederholen.';else if(invalid)$('xrStatus').textContent='Tracking nicht verfügbar / Position emuliert. Nicht messen.';else if($('xrStatus').textContent.startsWith('Tracking nicht'))$('xrStatus').textContent='Tracking wieder verfügbar.';updateOverlay();}
+}
+function onReset(e){if(!active)return;active.resets.push({utc:new Date().toISOString(),after_points:active.points.length});requested=false;save();updateOverlay();}
+function cleanup(s){if(s!==session)return;if(active){active.ended_utc=new Date().toISOString();active.complete=active.points.length===5&&!active.resets.length;save();}if(space)space.removeEventListener('reset',onReset);session=null;active=null;space=null;origin=null;latest=null;requested=false;starting=false;document.body.classList.remove('inXR');$('overlay').classList.remove('active');$('start').disabled=!canStart;updateSummary();status('AR beendet. Du kannst die Messdaten exportieren oder einen neuen Lauf starten.');}
+async function start(){if(starting||session)return;starting=true;$('start').disabled=true;let s;try{
+ s=await navigator.xr.requestSession('immersive-ar',{requiredFeatures:['dom-overlay'],domOverlay:{root:$('overlay')}});session=s;s.addEventListener('end',()=>cleanup(s),{once:true});
+ gl=$('canvas').getContext('webgl',{alpha:true,antialias:true,xrCompatible:true});if(!gl)throw Error('WebGL nicht verfügbar');await gl.makeXRCompatible();
+ s.updateRenderState({baseLayer:new XRWebGLLayer(s,gl,{alpha:true})});space=await s.requestReferenceSpace('local');space.addEventListener('reset',onReset);
+ active={id:Math.max(0,...runs.map(r=>r.id))+1,environment:$('environment').value,device:$('device').value,ua:navigator.userAgent,reference:'local',started_utc:new Date().toISOString(),points:[],resets:[],losses:0,wasInvalid:false,complete:false};runs.push(active);save();origin=null;latest=null;requested=false;lastUI=0;
+ $('live').textContent='Warte auf Tracking …';$('radial').textContent='';$('xrStatus').textContent='Am realen Startpunkt anhalten.';document.body.classList.add('inXR');$('overlay').classList.add('active');updateOverlay();s.requestAnimationFrame(frameLoop);
+ }catch(e){if(s){try{await s.end();}catch(_){}cleanup(s);}starting=false;$('start').disabled=!canStart;status(`AR-Start fehlgeschlagen: ${e.name}: ${e.message}\nPrüfe HTTPS, Browser, ARCore und DOM-Overlay-Unterstützung.`,true);}}
+$('start').addEventListener('click',start);
+$('capture').addEventListener('click',()=>{if(active&&latest&&!latest.emulated&&!active.resets.length&&STEPS[active.points.length]){requested=true;updateOverlay();}});
+$('undo').addEventListener('click',()=>{if(!active||active.resets.length)return;active.points.pop();if(!active.points.length)origin=null;save();$('xrStatus').textContent='Letzter Punkt gelöscht. Wiederhole diesen Messpunkt.';updateOverlay();});
+$('stop').addEventListener('click',()=>{if(session)session.end().catch(e=>{$('xrStatus').textContent=e.message;});});
+$('overlay').addEventListener('beforexrselect',e=>e.preventDefault());
+function csvValue(x){if(typeof x==='number')return Number.isFinite(x)?String(x):'';let s=String(x??'');if(/^[=+\-@\t\r]/.test(s))s="'"+s;return '"'+s.replaceAll('"','""')+'"';}
+$('export').addEventListener('click',()=>{const keys=['run','environment','device','user_agent','reference_space','run_started_utc','run_ended_utc','run_complete','reference_reset_count','reset_log','tracking_loss_events_total','label','target_m','x_m','y_m','z_m','dx_m','dy_m','dz_m','qx','qy','qz','qw','horizontal_distance_m','absolute_error_m','signed_error_m','frame_ms','utc','tracking_loss_events_at_capture'];const rows=[keys.join(',')];for(const r of runs)for(const p of r.points){rows.push([r.id,r.environment,r.device,r.ua,r.reference,r.started_utc,r.ended_utc,r.complete,r.resets.length,JSON.stringify(r.resets),r.losses,p.label,p.target,p.x,p.y,p.z,p.dx,p.dy,p.dz,p.qx,p.qy,p.qz,p.qw,p.distance,p.error,p.signed_error,p.frame_ms,p.utc,p.tracking_loss_events].map(csvValue).join(','));}const url=URL.createObjectURL(new Blob(['\uFEFF'+rows.join('\r\n')],{type:'text/csv;charset=utf-8'}));const a=document.createElement('a');a.href=url;a.download='webxr-messdaten-'+new Date().toISOString().slice(0,10)+'.csv';document.body.append(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),1500);});
+$('clear').addEventListener('click',()=>{if(confirm('Alle lokal gespeicherten Messungen löschen?')){runs=[];save();updateSummary();}});
+async function check(){updateSummary();if(!isSecureContext){status('Kein sicherer Kontext. Öffne die Anwendung über HTTPS (z. B. GitHub Pages).',true);return;}if(!navigator.xr){status('WebXR nicht verfügbar. Öffne die HTTPS-Seite in einem kompatiblen Android-Browser.',true);return;}try{canStart=await navigator.xr.isSessionSupported('immersive-ar');$('start').disabled=!canStart;status(canStart?'Immersive AR verfügbar. DOM Overlay wird beim Start geprüft.':'Immersive AR wird hier nicht unterstützt.',!canStart);}catch(e){status('WebXR-Prüfung fehlgeschlagen: '+e.message,true);}}
+check();
+</script>
+</body></html>
